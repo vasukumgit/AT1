@@ -1,0 +1,459 @@
+pipeline {
+
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+
+    environment {
+
+        GITHUB_REPO = "https://github.com/vasukumgit/AT1.git"
+        GIT_BRANCH  = "main"
+
+        BACKEND_IMAGE  = "shopverse-backend"
+        FRONTEND_IMAGE = "shopverse-frontend"
+
+        COMPOSE_FILE = "docker-compose.yml"
+
+        BACKEND_URL  = "http://localhost:5000/health"
+        FRONTEND_URL = "http://localhost:8181/health"
+    }
+
+    stages {
+
+        stage('Clean Workspace') {
+            steps {
+                deleteDir()
+            }
+        }
+
+        stage('Clone Repository') {
+            steps {
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[
+                        name: "${GIT_BRANCH}"
+                    ]],
+                    userRemoteConfigs: [[
+                        url: "${GITHUB_REPO}"
+                    ]],
+                    extensions: [
+                        [$class: 'CleanBeforeCheckout']
+                    ]
+                ])
+
+                sh '''
+                    set -e
+
+                    echo "===== Git Information ====="
+                    git branch --show-current
+                    git log -1 --oneline
+                '''
+            }
+        }
+
+        stage('Validate Project') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "===== Project Structure ====="
+                    ls -la
+
+                    echo "===== Checking Required Files ====="
+
+                    test -d backend
+                    test -d frontend
+
+                    test -f backend/Dockerfile
+                    test -f frontend/Dockerfile
+                    test -f frontend/nginx.conf
+                    test -f docker-compose.yml
+
+                    test -f backend/go.mod
+                    test -f frontend/package.json
+                    test -f frontend/package-lock.json
+
+                    echo "Project validation successful."
+                '''
+            }
+        }
+
+        stage('Backend Test') {
+            steps {
+                dir('backend') {
+                    sh '''
+                        set -e
+
+                        echo "===== Go Version ====="
+                        go version
+
+                        echo "===== Downloading Go Dependencies ====="
+                        go mod download
+
+                        echo "===== Running Go Tests ====="
+                        go test ./...
+
+                        echo "Backend tests successful."
+                    '''
+                }
+            }
+        }
+
+        stage('Frontend Build') {
+            steps {
+                dir('frontend') {
+                    sh '''
+                        set -e
+
+                        echo "===== Node Version ====="
+                        node --version
+
+                        echo "===== NPM Version ====="
+                        npm --version
+
+                        echo "===== Installing Dependencies ====="
+                        npm ci
+
+                        echo "===== Building Frontend ====="
+                        npm run build
+
+                        test -d dist
+
+                        echo "Frontend build successful."
+                    '''
+                }
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "===== Building Backend Image ====="
+
+                    docker build \
+                        -t ${BACKEND_IMAGE}:${BUILD_NUMBER} \
+                        ./backend
+
+                    echo "===== Building Frontend Image ====="
+
+                    docker build \
+                        -t ${FRONTEND_IMAGE}:${BUILD_NUMBER} \
+                        ./frontend
+
+                    echo "===== Docker Images ====="
+
+                    docker images | grep -E \
+                        "${BACKEND_IMAGE}|${FRONTEND_IMAGE}"
+                '''
+            }
+        }
+
+        stage('Trivy Scan') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "===== Trivy Backend Scan ====="
+
+                    trivy image \
+                        --severity HIGH,CRITICAL \
+                        --format table \
+                        ${BACKEND_IMAGE}:${BUILD_NUMBER}
+
+                    echo "===== Trivy Frontend Scan ====="
+
+                    trivy image \
+                        --severity HIGH,CRITICAL \
+                        --format table \
+                        ${FRONTEND_IMAGE}:${BUILD_NUMBER}
+
+                    echo "===== Generating JSON Reports ====="
+
+                    trivy image \
+                        --severity HIGH,CRITICAL \
+                        --format json \
+                        --output trivy-backend-${BUILD_NUMBER}.json \
+                        ${BACKEND_IMAGE}:${BUILD_NUMBER}
+
+                    trivy image \
+                        --severity HIGH,CRITICAL \
+                        --format json \
+                        --output trivy-frontend-${BUILD_NUMBER}.json \
+                        ${FRONTEND_IMAGE}:${BUILD_NUMBER}
+                '''
+            }
+        }
+
+        stage('Docker Compose Deployment') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "===== Deploying Application ====="
+
+                    export BACKEND_VERSION=${BUILD_NUMBER}
+                    export FRONTEND_VERSION=${BUILD_NUMBER}
+
+                    docker compose \
+                        -f ${COMPOSE_FILE} \
+                        up -d \
+                        --build
+
+                    echo "===== Running Containers ====="
+
+                    docker compose \
+                        -f ${COMPOSE_FILE} \
+                        ps
+                '''
+            }
+        }
+
+        stage('Health Check') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "===== Backend Health Check ====="
+
+                    BACKEND_HEALTHY=false
+
+                    for i in $(seq 1 30)
+                    do
+                        if curl -fsS "${BACKEND_URL}"
+                        then
+                            echo "Backend is healthy."
+                            BACKEND_HEALTHY=true
+                            break
+                        fi
+
+                        echo "Backend not ready. Attempt $i/30"
+                        sleep 5
+                    done
+
+                    if [ "${BACKEND_HEALTHY}" != "true" ]
+                    then
+                        echo "Backend health check failed."
+
+                        docker compose \
+                            -f ${COMPOSE_FILE} \
+                            logs --tail 100
+
+                        exit 1
+                    fi
+
+
+                    echo "===== Frontend Health Check ====="
+
+                    FRONTEND_HEALTHY=false
+
+                    for i in $(seq 1 30)
+                    do
+                        if curl -fsS "${FRONTEND_URL}"
+                        then
+                            echo "Frontend is healthy."
+                            FRONTEND_HEALTHY=true
+                            break
+                        fi
+
+                        echo "Frontend not ready. Attempt $i/30"
+                        sleep 5
+                    done
+
+                    if [ "${FRONTEND_HEALTHY}" != "true" ]
+                    then
+                        echo "Frontend health check failed."
+
+                        docker compose \
+                            -f ${COMPOSE_FILE} \
+                            logs --tail 100
+
+                        exit 1
+                    fi
+
+                    echo "===== Health Checks Successful ====="
+                '''
+            }
+        }
+
+        stage('Application Smoke Test') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "===== Application Smoke Test ====="
+
+                    HTTP_CODE=$(curl \
+                        -s \
+                        -o /tmp/application.html \
+                        -w "%{http_code}" \
+                        "${FRONTEND_URL}")
+
+                    echo "Application HTTP Status: ${HTTP_CODE}"
+
+                    if [ "${HTTP_CODE}" != "200" ]
+                    then
+                        echo "Smoke test failed."
+
+                        cat /tmp/application.html
+
+                        exit 1
+                    fi
+
+                    echo "Application smoke test successful."
+                '''
+            }
+        }
+
+        stage('Record Successful Deployment') {
+            steps {
+                sh '''
+                    set -e
+
+                    DEPLOYMENT_DIR="/tmp/shopverse-deployment"
+
+                    mkdir -p "${DEPLOYMENT_DIR}"
+
+                    echo "${BUILD_NUMBER}" \
+                        > "${DEPLOYMENT_DIR}/last_successful_build"
+
+                    echo "Successful build: ${BUILD_NUMBER}"
+                '''
+            }
+        }
+
+        stage('Docker Image Cleanup') {
+            steps {
+                sh '''
+                    set -e
+
+                    docker image prune -f
+
+                    echo "Docker image cleanup completed."
+                '''
+            }
+        }
+    }
+
+    post {
+
+        always {
+
+            echo "===== Archive Trivy Reports ====="
+
+            archiveArtifacts(
+                artifacts: 'trivy-*.json',
+                allowEmptyArchive: true
+            )
+
+            sh '''
+                docker compose \
+                    -f ${COMPOSE_FILE} \
+                    ps || true
+            '''
+        }
+
+        success {
+
+            echo """
+            =========================================
+            DEPLOYMENT SUCCESSFUL
+            BUILD: ${BUILD_NUMBER}
+            FRONTEND: ${FRONTEND_URL}
+            BACKEND: ${BACKEND_URL}
+            =========================================
+            """
+        }
+
+        failure {
+
+            echo """
+            =========================================
+            DEPLOYMENT FAILED
+            ROLLBACK STARTED
+            =========================================
+            """
+
+            sh '''
+                set +e
+
+                DEPLOYMENT_DIR="/tmp/shopverse-deployment"
+                LAST_SUCCESSFUL_BUILD="${DEPLOYMENT_DIR}/last_successful_build"
+
+                if [ ! -f "${LAST_SUCCESSFUL_BUILD}" ]
+                then
+                    echo "No previous version available."
+                    exit 0
+                fi
+
+                PREVIOUS_VERSION=$(cat "${LAST_SUCCESSFUL_BUILD}")
+
+                if [ -z "${PREVIOUS_VERSION}" ] || \
+                   [ "${PREVIOUS_VERSION}" = "0" ]
+                then
+                    echo "No previous deployment available."
+                    exit 0
+                fi
+
+                echo "Rolling back to: ${PREVIOUS_VERSION}"
+
+                export BACKEND_VERSION="${PREVIOUS_VERSION}"
+                export FRONTEND_VERSION="${PREVIOUS_VERSION}"
+
+                docker compose \
+                    -f ${COMPOSE_FILE} \
+                    up -d
+
+                echo "Waiting for rollback..."
+
+                sleep 15
+
+                echo "===== ROLLBACK STATUS ====="
+
+                docker compose \
+                    -f ${COMPOSE_FILE} \
+                    ps
+
+                echo "===== ROLLBACK BACKEND ====="
+
+                curl -fsS "${BACKEND_URL}"
+
+                BACKEND_RESULT=$?
+
+                echo ""
+                echo "===== ROLLBACK FRONTEND ====="
+
+                curl -fsS "${FRONTEND_URL}"
+
+                FRONTEND_RESULT=$?
+
+                if [ ${BACKEND_RESULT} -eq 0 ] && \
+                   [ ${FRONTEND_RESULT} -eq 0 ]
+                then
+
+                    echo ""
+                    echo "========================================"
+                    echo "ROLLBACK SUCCESSFUL"
+                    echo "VERSION: ${PREVIOUS_VERSION}"
+                    echo "========================================"
+
+                else
+
+                    echo ""
+                    echo "========================================"
+                    echo "ROLLBACK FAILED"
+                    echo "========================================"
+
+                    docker compose \
+                        -f ${COMPOSE_FILE} \
+                        logs --tail 100
+                fi
+            '''
+        }
+    }
+}

@@ -1,24 +1,35 @@
-FROM node:18-alpine AS builder
+# ---------- Build stage ----------
+FROM node:20-alpine AS builder
 
 WORKDIR /app
 
-COPY package.json package-lock.json* ./
-RUN npm install
+# Copy dependency files first
+COPY package.json package-lock.json ./
 
+# Install dependencies
+RUN npm ci
+
+# Copy application source
 COPY . .
 
-ARG VITE_API_URL=""
-ENV VITE_API_URL=$VITE_API_URL
-
+# Build React/Vite application
 RUN npm run build
 
+
+# ---------- Runtime stage ----------
 FROM nginx:alpine
 
-RUN apk upgrade --no-cache
+# Remove default Nginx configuration
+RUN rm /etc/nginx/conf.d/default.conf
 
-COPY --from=builder /app/dist /usr/share/nginx/html
+# Copy our Nginx configuration
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 
+# Copy Vite build output
+COPY --from=builder /app/dist /usr/share/nginx/html
+
+# Nginx listens on port 80
 EXPOSE 80
 
+# Start Nginx
 CMD ["nginx", "-g", "daemon off;"]

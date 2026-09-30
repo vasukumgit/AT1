@@ -1,22 +1,33 @@
-FROM golang:1.24-alpine AS builder
+# ---------- Build stage ----------
+FROM golang:1.24 AS builder
 
 WORKDIR /app
 
-RUN apk add --no-cache gcc musl-dev
-
+# Copy dependency files first
 COPY go.mod go.sum ./
+
+# Download dependencies
 RUN go mod download
 
+# Copy application source
 COPY . .
 
-RUN go mod tidy && CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /shopverse-api ./cmd/main.go
+# Build the application
+RUN CGO_ENABLED=0 GOOS=linux go build -o shopverse-backend ./cmd
 
-FROM gcr.io/distroless/static-debian12
+# ---------- Runtime stage ----------
+FROM alpine:3.20
 
-COPY --from=builder /shopverse-api /shopverse-api
+WORKDIR /app
 
-USER nonroot:nonroot
+# Install CA certificates
+RUN apk add --no-cache ca-certificates
 
-EXPOSE 8080
+# Copy compiled application
+COPY --from=builder /app/shopverse-backend .
 
-ENTRYPOINT ["/shopverse-api"]
+# Application port
+EXPOSE 5000
+
+# Start application
+CMD ["./shopverse-backend"]

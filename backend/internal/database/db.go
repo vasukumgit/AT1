@@ -17,9 +17,9 @@ var DB *gorm.DB
 func Connect() {
 	dbUser := getEnv("DB_USER", "shopverse")
 	dbPassword := getEnv("DB_PASSWORD", "shopverse123")
-	dbHost := getEnv("DB_HOST", "localhost")
+	dbHost := getEnv("DB_HOST", "database")
 	dbPort := getEnv("DB_PORT", "3306")
-	dbName := getEnv("DB_NAME", "shopverse")
+	dbName := getEnv("DB_NAME", "shopverse_db")
 
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=True&loc=Local",
 		dbUser, dbPassword, dbHost, dbPort, dbName)
